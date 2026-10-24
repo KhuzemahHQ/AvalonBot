@@ -89,17 +89,16 @@ def _upload_image(seat: int) -> Optional[Tuple[bytes, str, str]]:
     return path.read_bytes(), _MIME[suffix], "face" + suffix
 
 
-async def render_clip(seat: int, wav: bytes) -> Optional[bytes]:
-    """One fragmented MP4 of this seat's face speaking `wav`. None on failure."""
+async def iter_clip_chunks(seat: int, wav: bytes):
+    """Yields fragmented-MP4 bytes as Higgs generates them. Playback can start on the first frames."""
     if not BOSON_API_KEY or not wav:
-        return None
+        return
     prepared = _upload_image(seat)
     if prepared is None:
-        return None
+        return
     image, mime, filename = prepared
     timeout = aiohttp.ClientTimeout(total=180, sock_read=180)
     headers = {"Authorization": f"Bearer {BOSON_API_KEY}"}
-    data = b""
     try:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             for attempt in range(2):
@@ -117,19 +116,14 @@ async def render_clip(seat: int, wav: bytes) -> Optional[bytes]:
                     if resp.status != 200 or "json" in ctype:
                         err = (await resp.text())[:300]
                         print(f"[faces] seat {seat} clip failed {resp.status}: {err}")
-                        return None
-                    data = await resp.read()
-                    break
-            else:
-                print(f"[faces] seat {seat} clip failed 429")
-                return None
+                        return
+                    async for chunk in resp.content.iter_chunked(8192):
+                        if chunk:
+                            yield chunk
+                    return
+            print(f"[faces] seat {seat} clip failed 429")
     except Exception as exc:
         print(f"[faces] seat {seat} clip error: {type(exc).__name__}")
-        return None
-    if not data or data[:1] == b"{":
-        print(f"[faces] seat {seat} clip was empty")
-        return None
-    return data
 
 
 async def _pause() -> None:

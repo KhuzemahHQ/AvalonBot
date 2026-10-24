@@ -11,6 +11,8 @@ interface PlayerAvatarProps {
   videoTrack?: RemoteTrack | null;
   audioTrack?: RemoteTrack | null;
   clipUrl?: string | null;
+  clipSeq?: number | null;
+  onClipPhase?: (seq: number, phase: "started" | "finished") => void;
   faceStamp?: string;
   muted?: boolean;
   level: number;
@@ -52,12 +54,59 @@ function AvatarVideo({ video, audio, muted, mirror }: { video: RemoteTrack; audi
   );
 }
 
-function FaceClip({ url }: { url: string }) {
+function FaceClip({
+  url,
+  muted,
+  onPlaying,
+  onEnded,
+}: {
+  url: string;
+  muted: boolean;
+  onPlaying: () => void;
+  onEnded: () => void;
+}) {
+  const ref = useRef<HTMLVideoElement>(null);
+  const playingRef = useRef(onPlaying);
+  const endedRef = useRef(onEnded);
+  playingRef.current = onPlaying;
+  endedRef.current = onEnded;
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    el.muted = muted;
+  }, [muted]);
+  useEffect(() => {
+    const el = ref.current;
+    if (!el) return;
+    let alive = true;
+    let began = false;
+    let ended = false;
+    const begin = () => {
+      if (!alive || began || el.currentTime < 0.05) return;
+      began = true;
+      playingRef.current();
+    };
+    const finish = () => {
+      if (!alive || ended) return;
+      ended = true;
+      endedRef.current();
+    };
+    el.muted = muted;
+    el.addEventListener("timeupdate", begin);
+    el.addEventListener("ended", finish);
+    el.play().catch(() => finish());
+    return () => {
+      alive = false;
+      el.removeEventListener("timeupdate", begin);
+      el.removeEventListener("ended", finish);
+    };
+  }, [url]);
   return (
     <video
+      ref={ref}
       src={url}
       autoPlay
-      muted
+      muted={muted}
       playsInline
       className="absolute inset-0 h-full w-full object-cover object-top"
     />
@@ -99,7 +148,7 @@ function stripTtsTokens(text: string): string {
     .trim();
 }
 
-export default function PlayerAvatar({ player, isLeader, isOnTeam, vote, showRole, videoTrack, audioTrack, clipUrl, faceStamp = "", muted = false, level, width }: PlayerAvatarProps) {
+export default function PlayerAvatar({ player, isLeader, isOnTeam, vote, showRole, videoTrack, audioTrack, clipUrl, clipSeq = null, onClipPhase, faceStamp = "", muted = false, level, width }: PlayerAvatarProps) {
   const color = SEAT_COLORS[player.seat];
   const speaking = player.isSpeaking || level > 0.05;
   const height = Math.round(width * 1.25);
@@ -122,7 +171,16 @@ export default function PlayerAvatar({ player, isLeader, isOnTeam, vote, showRol
       >
         <div className="relative h-full w-full overflow-hidden rounded-[0.8rem] bg-medieval-surface">
           {clipUrl ? (
-            <FaceClip url={clipUrl} />
+            <FaceClip
+              url={clipUrl}
+              muted={muted}
+              onPlaying={() => {
+                if (clipSeq != null) onClipPhase?.(clipSeq, "started");
+              }}
+              onEnded={() => {
+                if (clipSeq != null) onClipPhase?.(clipSeq, "finished");
+              }}
+            />
           ) : !faceFailed ? (
             <FaceStill seat={player.seat} stamp={faceStamp} onError={() => setFaceFailed(true)} />
           ) : videoTrack ? (
