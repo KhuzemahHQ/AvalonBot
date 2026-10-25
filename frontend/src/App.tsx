@@ -45,7 +45,7 @@ export default function App() {
   const [voiceOn, setVoiceOn] = useState(true);
 
   const audio = useAudio();
-  const { gameState, isConnected, startGame, sendHumanAction, pause, resume, step, setSpeed, setVoice, availableGames, seatClips, exportGame, playUpload } =
+  const { gameState, isConnected, startGame, sendHumanAction, pause, resume, step, setSpeed, setVoice, availableGames, seatClips, seatClipSeq, reportClip, exportGame, playUpload } =
     useGameSocket("/ws/game", audio.playAudio);
   const [faceStamp, setFaceStamp] = useState("");
   useEffect(() => {
@@ -59,7 +59,7 @@ export default function App() {
         .catch(() => undefined);
     };
     tick();
-    const id = setInterval(tick, 4000);
+    const id = setInterval(tick, 20000);
     return () => {
       stop = true;
       clearInterval(id);
@@ -239,6 +239,8 @@ export default function App() {
                 proposal={gameState.currentProposal}
                 showRoles={showRoles}
                 seatClips={seatClips}
+                seatClipSeq={seatClipSeq}
+                onClipPhase={reportClip}
                 faceStamp={faceStamp}
                 muted={audio.isMuted}
                 levels={audio.levels}

@@ -11,7 +11,8 @@ renders a talking clip of that seat's face. Otherwise a running LiveKit avatar s
 browser plays the WAV.
 
 Messages to the browser (all {"type", "seq", "data"}):
-  game_list, game_start, role_reveal, utterance, evil_chat, speaking, audio, avatar_clip, team_proposed,
+  game_list, game_start, role_reveal, utterance, evil_chat, speaking, audio, clip_open,
+  clip_chunk, clip_end, team_proposed,
   team_vote_result, quest_result, assassination, game_over, memory_update, replay_end, error
 
 Run:  py -3.12 -m uvicorn server.ws_server:app --port 8000
@@ -44,7 +45,7 @@ from avalon.engine import ROLE_NAMES, Role  # noqa: E402
 from avalon.replay import load_events, load_talk_edges  # noqa: E402
 from avalon.runner import AvalonGameRunner  # noqa: E402
 from server.audio_proxy import BOSON_API_KEY, get_tts_audio  # noqa: E402
-from server.face_clips import face_stamp, render_clip, still_for_seat  # noqa: E402
+from server.face_clips import face_stamp, iter_clip_chunks, still_for_seat  # noqa: E402
 from server.livekit_avatars import AvatarManager  # noqa: E402
 from server.memory_view import serialize_memories  # noqa: E402
 from server.human_web_agent import HumanWebAgent  # noqa: E402
@@ -193,6 +194,7 @@ class GameSession:
         self._speech_drained.set()
         self._speech: asyncio.Queue = asyncio.Queue()
         self._speech_worker = asyncio.create_task(self._play_speech())
+        self._clip_wait: Optional[tuple] = None
 
     def resolve_human_action(self, action: str, data: Dict[str, Any]) -> None:
         if self.human_agent:
@@ -242,6 +244,7 @@ class GameSession:
     def drop_pending_speech(self) -> None:
         """Drops lines not yet playing. The line already in the mouth finishes."""
         self.speech_epoch += 1
+        self._release_clip_wait()
         dropped = 0
         while True:
             try:
@@ -308,7 +311,12 @@ class GameSession:
                     wav_b64 = None
                 if epoch != self.speech_epoch:
                     continue
-                await self._emit_audio(seat, text, seq, wav_b64, reveal)
+                try:
+                    await self._emit_audio(seat, text, seq, wav_b64, reveal)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    print(f"[speech] seat {seat} {type(exc).__name__}: {exc}")
             finally:
                 self._speech_pending -= 1
                 if self._speech_pending <= 0:
@@ -336,16 +344,11 @@ class GameSession:
             await self.send("speaking", {"seat": seat, "active": True}, seq)
 
         wav = base64.b64decode(wav_b64) if wav_b64 else b""
+        epoch = self.speech_epoch
         if wav and self.face_clips:
-            clip = await render_clip(seat, wav)
-            if clip:
-                await begin()
-                # The clip's own soundtrack is muted in the browser. This wav is the one play,
-                # so the line does not speak again out of the video after the mouth stops.
-                await self.send("avatar_clip", {"seat": seat, "video": base64.b64encode(clip).decode("ascii")}, seq)
-                await self.send("audio", {"speaker": seat, "audio": wav_b64, "format": "wav"}, seq)
-                await self.sleep(wav_seconds(wav) + 0.3)
-                await self.send("speaking", {"seat": seat, "active": False}, seq)
+            if await self._play_stream(seat, wav, seq, begin):
+                return
+            if epoch != self.speech_epoch or self.closed:
                 return
         await begin()
         if wav and avatar_manager.has_seat(seat):
@@ -359,6 +362,107 @@ class GameSession:
             else:
                 await self.sleep(min(3.0, 1.0 + 0.05 * len(text.split())))
         await self.send("speaking", {"seat": seat, "active": False}, seq)
+
+    def ack_clip(self, kind: str, seq: object) -> None:
+        """The browser reports when this clip actually starts and when it finishes."""
+        wait = self._clip_wait
+        if wait is None or seq != wait[0]:
+            return
+        fut = wait[1] if kind == "clip_started" else wait[2]
+        if not fut.done():
+            fut.set_result(True)
+
+    def _release_clip_wait(self) -> None:
+        wait = self._clip_wait
+        if wait is None:
+            return
+        for fut in (wait[1], wait[2]):
+            if not fut.done():
+                fut.set_result(False)
+
+    async def _play_stream(self, seat: int, wav: bytes, seq: int, begin) -> bool:
+        """Shows this line when its clip starts playing, and holds the next line until it ends."""
+        epoch = self.speech_epoch
+        if self.closed:
+            return False
+        loop = asyncio.get_running_loop()
+        started = loop.create_future()
+        finished = loop.create_future()
+        self._clip_wait = (seq, started, finished)
+        incoming: asyncio.Queue = asyncio.Queue()
+        end_mark = object()
+
+        async def pull() -> None:
+            try:
+                async for chunk in iter_clip_chunks(seat, wav):
+                    await incoming.put(chunk)
+            finally:
+                await incoming.put(end_mark)
+
+        producer = asyncio.create_task(pull())
+        getter: Optional[asyncio.Task] = None
+        sent = False
+        revealed = False
+        played = False
+        try:
+            await self.send("clip_open", {"seat": seat}, seq)
+            getter = asyncio.create_task(incoming.get())
+            while True:
+                if epoch != self.speech_epoch or self.closed:
+                    return False
+                waiting = {getter}
+                if not revealed:
+                    waiting.add(started)
+                    waiting.add(finished)
+                done, _pending = await asyncio.wait(waiting, return_when=asyncio.FIRST_COMPLETED)
+                if not revealed and started.done() and not started.result():
+                    return False
+                if not revealed and finished.done() and not started.done():
+                    return False
+                if not revealed and started.done() and started.result():
+                    revealed = True
+                    await begin()
+                if getter not in done:
+                    continue
+                item = getter.result()
+                if item is end_mark:
+                    break
+                sent = True
+                await self.send(
+                    "clip_chunk",
+                    {"seat": seat, "b64": base64.b64encode(item).decode("ascii")},
+                    seq,
+                )
+                getter = asyncio.create_task(incoming.get())
+            if epoch == self.speech_epoch and not self.closed:
+                await self.send("clip_end", {"seat": seat}, seq)
+            if not sent or epoch != self.speech_epoch or self.closed:
+                return False
+            if not revealed:
+                if finished.done() and not started.done():
+                    return False
+                try:
+                    ok = await asyncio.wait_for(started, 20)
+                except asyncio.TimeoutError:
+                    ok = False
+                if epoch != self.speech_epoch or self.closed or not ok:
+                    return False
+                await begin()
+            if not finished.done():
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(finished, wav_seconds(wav) + 3)
+            if epoch == self.speech_epoch and not self.closed:
+                await self.send("speaking", {"seat": seat, "active": False}, seq)
+            played = True
+            return True
+        finally:
+            producer.cancel()
+            if getter is not None and not getter.done():
+                getter.cancel()
+            if not played and not self.closed:
+                await self.send("clip_cancel", {"seat": seat}, seq)
+            if self._clip_wait is not None and self._clip_wait[0] == seq:
+                self._clip_wait = None
 
 
 # One model call at a time. A new LLM game would otherwise fire a seat's discussion
@@ -396,6 +500,8 @@ async def game_ws(ws: WebSocket):
                     human_seat = msg.get("human_seat")
                     players = "llm" if msg.get("players") == "llm" else "heuristic"
                     session.start(run_live_game(session, human_seat=human_seat, players=players))
+            elif kind in ("clip_started", "clip_finished"):
+                session.ack_clip(kind, msg.get("seq"))
             elif kind == "human_action_response":
                 session.resolve_human_action(msg.get("action", ""), msg.get("data", {}))
             elif kind == "stop":
@@ -503,7 +609,7 @@ async def run_playback(session: GameSession, events: List[Any]) -> None:
         kind = str(raw.get("type") or "")
         data = dict(raw.get("data") or {})
         seq = int(raw.get("seq") or 0)
-        if kind in ("audio", "avatar_clip", "speaking", "game_list", "human_prompt", "human_prompt_clear"):
+        if kind in ("audio", "avatar_clip", "clip_open", "clip_chunk", "clip_end", "speaking", "game_list", "human_prompt", "human_prompt_clear"):
             continue
         await session.gate()
         if kind in ("utterance", "evil_chat"):

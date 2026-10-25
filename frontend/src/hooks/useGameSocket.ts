@@ -12,6 +12,7 @@ import type {
   TeamProposal,
 } from "../types";
 import { SEAT_NAMES } from "../types";
+import { createClipHub, decodeB64 } from "./clipStream";
 
 type Data = Record<string, unknown>;
 
@@ -292,6 +293,8 @@ interface UseGameSocketReturn {
   setVoice: (on: boolean) => void;
   availableGames: string[];
   seatClips: Record<number, string>;
+  seatClipSeq: Record<number, number>;
+  reportClip: (seq: number, phase: "started" | "finished") => void;
   exportGame: () => void;
   playUpload: (events: { type: string; seq?: number; data?: Data }[]) => void;
 }
@@ -304,9 +307,17 @@ export function useGameSocket(
   const [isConnected, setIsConnected] = useState(false);
   const [availableGames, setAvailableGames] = useState<string[]>([]);
   const [seatClips, setSeatClips] = useState<Record<number, string>>({});
+  const [seatClipSeq, setSeatClipSeq] = useState<Record<number, number>>({});
   const seatClipsRef = useRef<Record<number, string>>({});
   seatClipsRef.current = seatClips;
   const recordingRef = useRef<{ type: string; seq: number; data: Data }[]>([]);
+  const clipHubRef = useRef<ReturnType<typeof createClipHub> | null>(null);
+  if (!clipHubRef.current) {
+    clipHubRef.current = createClipHub((seat, url, seq) => {
+      setSeatClips((prev) => ({ ...prev, [seat]: url }));
+      setSeatClipSeq((prev) => ({ ...prev, [seat]: seq }));
+    });
+  }
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const reconnectDelay = useRef(1000);
@@ -348,8 +359,47 @@ export function useGameSocket(
         onAudioRef.current?.(data.speaker as number, data.audio as string);
         return;
       }
-      if (msg.type !== "audio" && msg.type !== "avatar_clip" && msg.type !== "speaking" && msg.type !== "game_list" && msg.type !== "human_prompt" && msg.type !== "human_prompt_clear") {
+      if (
+        msg.type !== "audio" &&
+        msg.type !== "avatar_clip" &&
+        msg.type !== "clip_open" &&
+        msg.type !== "clip_chunk" &&
+        msg.type !== "clip_end" &&
+        msg.type !== "clip_cancel" &&
+        msg.type !== "speaking" &&
+        msg.type !== "game_list" &&
+        msg.type !== "human_prompt" &&
+        msg.type !== "human_prompt_clear"
+      ) {
         recordingRef.current.push({ type: msg.type, seq: msg.seq ?? 0, data });
+      }
+      if (msg.type === "clip_open") {
+        clipHubRef.current?.open(Number(data.seat), msg.seq ?? 0);
+        return;
+      }
+      if (msg.type === "clip_chunk") {
+        const b64 = String(data.b64 ?? "");
+        if (b64) clipHubRef.current?.chunk(Number(data.seat), msg.seq ?? 0, decodeB64(b64));
+        return;
+      }
+      if (msg.type === "clip_end") {
+        clipHubRef.current?.end(Number(data.seat), msg.seq ?? 0);
+        return;
+      }
+      if (msg.type === "clip_cancel") {
+        const seat = Number(data.seat);
+        clipHubRef.current?.drop(seat, msg.seq ?? 0);
+        setSeatClips((prev) => {
+          const next = { ...prev };
+          delete next[seat];
+          return next;
+        });
+        setSeatClipSeq((prev) => {
+          const next = { ...prev };
+          delete next[seat];
+          return next;
+        });
+        return;
       }
       if (msg.type === "avatar_clip") {
         const seat = Number(data.seat);
@@ -396,8 +446,9 @@ export function useGameSocket(
     (mode: "live" | "replay", replayFile?: string, humanSeat?: number | null, players?: "llm" | "heuristic") => {
       dispatch({ type: "RESET" });
       recordingRef.current = [];
-      for (const url of Object.values(seatClipsRef.current)) URL.revokeObjectURL(url);
+      clipHubRef.current?.reset();
       setSeatClips({});
+      setSeatClipSeq({});
       send({ type: "start_game", mode, replay_file: replayFile, human_seat: humanSeat, players });
     },
     [send]
@@ -424,6 +475,10 @@ export function useGameSocket(
     setVoice: useCallback((on: boolean) => send({ type: "settings", voice: on }), [send]),
     availableGames,
     seatClips,
+    seatClipSeq,
+    reportClip: useCallback((seq: number, phase: "started" | "finished") => {
+      send({ type: phase === "started" ? "clip_started" : "clip_finished", seq });
+    }, [send]),
     exportGame: useCallback(() => {
       const payload = JSON.stringify({ version: 1, events: recordingRef.current });
       const url = URL.createObjectURL(new Blob([payload], { type: "application/json" }));
@@ -436,8 +491,9 @@ export function useGameSocket(
     playUpload: useCallback((events: { type: string; seq?: number; data?: Data }[]) => {
       dispatch({ type: "RESET" });
       recordingRef.current = [];
-      for (const url of Object.values(seatClipsRef.current)) URL.revokeObjectURL(url);
+      clipHubRef.current?.reset();
       setSeatClips({});
+      setSeatClipSeq({});
       send({ type: "start_playback", events });
     }, [send]),
   };

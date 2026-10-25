@@ -153,7 +153,8 @@ class LLMAgent(Agent):
             "Content-Type": "application/json",
         }
         url = f"{self.base_url}/chat/completions"
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=45)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, json=payload, headers=headers) as resp:
                 if resp.status != 200:
                     err_msg = await resp.text()

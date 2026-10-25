@@ -11,6 +11,8 @@ interface GameTableProps {
   seatVideos?: Record<number, RemoteTrack>;
   seatAudio?: Record<number, RemoteTrack>;
   seatClips: Record<number, string>;
+  seatClipSeq?: Record<number, number>;
+  onClipPhase?: (seq: number, phase: "started" | "finished") => void;
   faceStamp?: string;
   muted: boolean;
   levels: Record<number, number>;
@@ -25,7 +27,7 @@ function seatPosition(seat: number) {
   return { left: 50 + SEAT_RADIUS * 100 * Math.cos(angle), top: 50 + SEAT_RADIUS * 100 * Math.sin(angle) };
 }
 
-export default function GameTable({ players, leader, proposal, showRoles, seatVideos = {}, seatAudio = {}, seatClips, faceStamp = "", muted, levels, children }: GameTableProps) {
+export default function GameTable({ players, leader, proposal, showRoles, seatVideos = {}, seatAudio = {}, seatClips, seatClipSeq = {}, onClipPhase, faceStamp = "", muted, levels, children }: GameTableProps) {
   const ref = useRef<HTMLDivElement>(null);
   const [size, setSize] = useState(640);
   useEffect(() => {
@@ -71,6 +73,8 @@ export default function GameTable({ players, leader, proposal, showRoles, seatVi
               videoTrack={seatVideos[player.seat] ?? null}
               audioTrack={seatAudio[player.seat] ?? null}
               clipUrl={seatClips[player.seat] ?? null}
+              clipSeq={seatClipSeq[player.seat] ?? null}
+              onClipPhase={onClipPhase}
               faceStamp={faceStamp}
               muted={muted}
               level={levels[player.seat] ?? 0}
